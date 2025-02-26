@@ -1,0 +1,4 @@
+# ninja log v5
+0	5294	1731396297572308736	/home/shijie/Documents/Dreaminit/DreamInit/submodules/simple-knn/build/temp.linux-x86_64-3.9/simple_knn.o	fbdae0d1db1ec859
+0	7544	1731396299821288267	/home/shijie/Documents/Dreaminit/DreamInit/submodules/simple-knn/build/temp.linux-x86_64-3.9/ext.o	cc0977c6ae221d6
+0	23560	1731396315837151544	/home/shijie/Documents/Dreaminit/DreamInit/submodules/simple-knn/build/temp.linux-x86_64-3.9/spatial.o	87466e60bc52d719
