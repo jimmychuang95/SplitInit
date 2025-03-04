@@ -301,7 +301,7 @@ class Trainer(object):
                 azimuth.append(data[i]['cameras'][j].delta_azimuth)
 
             text_embeddings = data[i]['text_embeddings']
-            images = pred_images[i * C: (i + 1) * C]
+            images = pred_images[i * C: (i + 1) * C] #torch.Size([4, 3, 512, 512])
             if 'SD' in self.guidance:
                 text_z = [text_embeddings['uncond']] * C
                 if self.opt.perpneg:
