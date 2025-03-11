@@ -4,6 +4,7 @@ from .generator import Generator
 from generator.gaussian_utils.gaussian_model import GaussianModel
 from generator.gaussian_utils.gaussian_renderer import render
 import numpy as np
+from gsplat import rasterization
 
 C0 = 0.28209479177387814
 def RGB2SH(rgb):
@@ -85,15 +86,41 @@ class DreamInit(nn.Module):
                 rgbs.append(rgb)
         rgbs = torch.stack(rgbs, dim=0)
         return {'rgbs': rgbs}
+    
+    def render_gsplat(self, gaussians, views):
+        B = len(gaussians)
+        C = len(views[0])
+        rgbs = []
+        for i in range(B):
+            gaussian = gaussians[i]
+            for j in range(C):
+                view = views[i][j]
+                output, _, _ = rasterization(
+                    gaussian._xyz,
+                    gaussian._rotation,
+                    gaussian._scaling,
+                    gaussian._opacity.squeeze(-1),
+                    gaussian._features_dc,
+                    view.viewmat[None],
+                    view.K[None],
+                    width=view.image_width,
+                    height=view.image_height,
+                    sh_degree=0,
+                )
+                rgb = output.permute(0, 3, 1, 2).squeeze(0)
+                rgbs.append(rgb)
+        rgbs = torch.stack(rgbs, dim=0)
+        return {'rgbs': rgbs}
+
 
     def forward(self, text_zs, cameras):
         if self.training:
             gaussians = self.gaussian_generate(text_zs)
-            outputs = self.render(gaussians, cameras)
-            return outputs
+            outputs = self.render_gsplat(gaussians, cameras)
+            return outputs, gaussians
         else:
             gaussians, all_top_k_indices, opacity_list = self.gaussian_generate(text_zs)
-            outputs = self.render(gaussians, cameras)
+            outputs = self.render_gsplat(gaussians, cameras)
             return outputs, all_top_k_indices, opacity_list, gaussians
 
     def get_params(self, lr):

@@ -290,7 +290,12 @@ class Trainer(object):
             cameras.append(data[i]['cameras'])
         text_zs = torch.cat(text_zs, dim=0)  # [B, 77, 1024]
 
-        outputs = self.model(text_zs, cameras)  # must pass through ddp.forward, connot directly use ddp.module
+        outputs, gaussians = self.model(text_zs, cameras)  # output: torch.Size([4, 3, 512, 512])
+        for i in range(B):
+            gaussians[i]._features_dc = torch.zeros(gaussians[i].get_features.shape[0], 1, 77, device="cuda", requires_grad=True)
+        test = self.model.render(gaussians, cameras)
+        # print(f"test: {test['rgbs'].shape}, outputs: {outputs['rgbs'].shape}")
+
         pred_images = outputs['rgbs']  # [B*C, 3, H, W]
         as_latent = False
 

@@ -518,7 +518,6 @@ def save_attention_maps(attn_maps, pipe, prompts, global_step, base_dir='attn_ma
 
         save_token_attention_grid(attn_map, total_tokens[0], layer_dir, to_pil)
 
-    print(f'total_attn_map: {total_attn_map.shape}')
     total_dir = os.path.join(global_step_dir, "total_attn_map")
     os.makedirs(total_dir, exist_ok=True)
     total_attn_map /= total_attn_map_number

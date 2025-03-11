@@ -125,6 +125,7 @@ def circle_poses(radius=torch.tensor([3.2]), theta=torch.tensor([60]), phi=torch
 
     poses = torch.eye(4, dtype=torch.float).unsqueeze(0).repeat(len(centers), 1, 1)
     poses[:, :3, :3] = torch.stack((-right_vector, up_vector, forward_vector), dim=-1)
+
     poses[:, :3, 3] = centers
 
     return poses.numpy()
@@ -145,7 +146,7 @@ def GenerateRandomCameras(opt, size=2000, SSAA=True):
                                              angle_overhead=opt.angle_overhead, angle_front=opt.angle_front,
                                              uniform_sphere_rate=opt.uniform_sphere_rate,
                                              rand_cam_gamma=1.0)
-    # delta polar/azimuth/radius to default view
+        # delta polar/azimuth/radius to default view
     delta_polar = thetas - opt.default_polar
     delta_azimuth = phis - opt.default_azimuth
     delta_azimuth[delta_azimuth > 180] -= 360  # range in [-180, 180]
@@ -432,14 +433,29 @@ class RCamera(nn.Module):
         self.trans = trans
         self.scale = scale
 
-        RT = torch.tensor(getWorld2View2(R, T, trans, scale))
-        self.world_view_transform = RT.transpose(0, 1).cuda()
+        self.RT = torch.tensor(getWorld2View2(R, T, trans, scale), device=self.data_device)
+        self.world_view_transform = self.RT.transpose(0, 1).cuda()
         self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx,
                                                      fovY=self.FoVy).transpose(0, 1).cuda()
         self.full_proj_transform = (
             self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
 
+        #####################################################
+        self.viewmat = torch.eye(4, device=self.data_device).float()
+        self.viewmat[:3, :3] = torch.tensor(self.R, device=self.data_device).float()
+        self.viewmat[:3, 3] = torch.tensor(self.T, device=self.data_device).float()
+
+        fx = 0.5 * self.image_width / math.tan(0.5 * self.FoVx)
+        fy = 0.5 * self.image_height / math.tan(0.5 * self.FoVy)
+        cx = self.image_width / 2
+        cy = self.image_height / 2
+
+        self.K = torch.tensor([
+            [fx, 0, cx],
+            [0, fy, cy],
+            [0, 0,  1]
+        ], device=self.data_device)
 
 class GasussianDataset:
     def __init__(self, opt, device, guidance, type='train'):
