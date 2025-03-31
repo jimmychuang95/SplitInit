@@ -442,10 +442,14 @@ class RCamera(nn.Module):
         self.camera_center = self.world_view_transform.inverse()[3, :3]
 
         #####################################################
-        self.viewmat = torch.eye(4, device=self.data_device).float()
-        self.viewmat[:3, :3] = torch.tensor(self.R, device=self.data_device).float()
-        self.viewmat[:3, 3] = torch.tensor(self.T, device=self.data_device).float()
+        # self.viewmat = torch.eye(4, device=self.data_device).float()
+        # self.viewmat[:3, :3] = torch.tensor(self.R.T, device=self.data_device).float()
+        # self.viewmat[:3, 3] = torch.tensor(self.T, device=self.data_device).float()
 
+        # self.viewmat = torch.tensor(getWorld2View2(R, T, np.array([0,0,0]), 1.0)).cuda()
+
+        self.viewmat = self.world_view_transform.transpose(0, 1)
+        
         fx = 0.5 * self.image_width / math.tan(0.5 * self.FoVx)
         fy = 0.5 * self.image_height / math.tan(0.5 * self.FoVy)
         cx = self.image_width / 2

@@ -29,23 +29,15 @@ class Generator(nn.Module):
         B, N, _ = input.shape
         x = self.proj_in(input)
 
-        all_top_k_indices = [] if not self.training else None
+        attns = []
 
         for block in self.transformer_blocks:
-            if self.training:
-                x = block(input, x, context=z)
-            else:
-                # x = block(input, x, context=z)
-                x, top_k_indices = block(input, x, context=z)
-                all_top_k_indices.append(top_k_indices)
+            x, attn = block(input, x, context=z)
+            attns.append(attn)
 
         shape = self.shape_transform(torch.cat([x, input], dim=-1))
         color = self.color_transform(torch.cat([x, input], dim=-1))
 
-        if self.training:
-            return torch.cat([shape, color], dim=-1)
-        else:
-            # return torch.cat([shape, color], dim=-1)
-            return torch.cat([shape, color], dim=-1), all_top_k_indices
+        return torch.cat([shape, color], dim=-1), attns
 
 

@@ -13,9 +13,13 @@ import numpy as np
 
 import time
 
+import gc
+import colorsys
+
 import torch
 import torch.optim as optim
 from torchvision.utils import save_image
+import torch.nn.functional as F
 
 from rich.console import Console
 from torch_ema import ExponentialMovingAverage
@@ -24,6 +28,8 @@ from packaging import version as pver
 from save_xyz_color import save_xyz_color
 
 from generator.gaussian_utils.gaussian_model import GaussianModel
+
+from guidance.attn_map_utils import attn_maps, get_total_attention_maps
 
 def adjust_text_embeddings(embeddings, azimuth, opt):
     with torch.no_grad():
@@ -290,16 +296,11 @@ class Trainer(object):
             cameras.append(data[i]['cameras'])
         text_zs = torch.cat(text_zs, dim=0)  # [B, 77, 1024]
 
-        outputs, gaussians = self.model(text_zs, cameras)  # output: torch.Size([4, 3, 512, 512])
-        for i in range(B):
-            gaussians[i]._features_dc = torch.zeros(gaussians[i].get_features.shape[0], 1, 77, device="cuda", requires_grad=True)
-        test = self.model.render(gaussians, cameras)
-        # print(f"test: {test['rgbs'].shape}, outputs: {outputs['rgbs'].shape}")
-
+        outputs, gtf_attns, gaussians = self.model(text_zs, cameras)  # output: torch.Size([4, 3, 512, 512])
         pred_images = outputs['rgbs']  # [B*C, 3, H, W]
         as_latent = False
 
-        loss = 0
+        guidance_loss = 0
         for i in range(B):
             azimuth = []
             for j in range(C):
@@ -307,44 +308,7 @@ class Trainer(object):
 
             text_embeddings = data[i]['text_embeddings']
             images = pred_images[i * C: (i + 1) * C] #torch.Size([4, 3, 512, 512])
-            if 'SD' in self.guidance:
-                text_z = [text_embeddings['uncond']] * C
-                if self.opt.perpneg:
-
-                    text_z_comp, weights = adjust_text_embeddings(text_embeddings, azimuth, self.opt)
-                    text_z.append(text_z_comp)
-
-                else:
-                    for c in range(C):
-                        if azimuth[c] >= -90 and azimuth[c] < 90:
-                            if azimuth[c] >= 0:
-                                r = 1 - azimuth[c] / 90
-                            else:
-                                r = 1 + azimuth[c] / 90
-                            start_z = text_embeddings['front']
-                            end_z = text_embeddings['side']
-                        else:
-                            if azimuth[c] >= 0:
-                                r = 1 - (azimuth[c] - 90) / 90
-                            else:
-                                r = 1 + (azimuth[c] + 90) / 90
-                            start_z = text_embeddings['side']
-                            end_z = text_embeddings['back']
-                        text_z.append(r * start_z + (1 - r) * end_z)
-
-                text_z = torch.cat(text_z, dim=0)
-                if self.opt.perpneg:
-                    loss = loss + self.guidance['SD'].train_step_perpneg(text_z, weights, images, as_latent=as_latent,
-                                                                         guidance_scale=self.opt.guidance_scale,
-                                                                         grad_scale=self.opt.lambda_guidance,
-                                                                         save_guidance_path=save_guidance_path)
-                else:
-                    loss = loss + self.guidance['SD'].train_step(text_z, images, as_latent=as_latent,
-                                                                 guidance_scale=self.opt.guidance_scale,
-                                                                 grad_scale=self.opt.lambda_guidance,
-                                                                 save_guidance_path=save_guidance_path)
-
-
+            
             if 'IF' in self.guidance:
                 with torch.no_grad():
                     text_z = [text_embeddings['uncond']] * C
@@ -372,50 +336,56 @@ class Trainer(object):
 
                     text_z = torch.cat(text_z, dim=0) # torch.Size([16, 77, 4096])
                 if self.opt.perpneg:
-                    loss = loss + self.guidance['IF'].train_step_perpneg(text_z, weights, images, global_step, prompt=self.opt.prompt, workspace=self.workspace,
+                    guidance_loss = guidance_loss + self.guidance['IF'].train_step_perpneg(text_z, weights, images, global_step, prompt=self.opt.prompt, workspace=self.workspace,
                                                                         guidance_scale=self.opt.guidance_scale,
                                                                         grad_scale=self.opt.lambda_guidance)
                 else:
-                    loss = loss + self.guidance['IF'].train_step(text_z, images,
+                    guidance_loss = guidance_loss + self.guidance['IF'].train_step(text_z, images,
                                                                 guidance_scale=self.opt.guidance_scale,
                                                                 grad_scale=self.opt.lambda_guidance)
+        
 
+        ###############################################################################
+        gaussian_noms = torch.zeros(gaussians[0].get_features.shape[0], 77, device=self.device)
+        gaussian_denoms = torch.ones(gaussians[0].get_features.shape[0], device=self.device) * 1e-12
 
-            if 'IF2' in self.guidance:
-                text_z = [text_embeddings['uncond']] * C
-                if self.opt.perpneg:
+        for i in range(B):
+            gaussians[i]._features_dc = torch.zeros(gaussians[i].get_features.shape[0], 77, device="cuda", requires_grad=True)
+        output_for_grad_noms = self.model.render_gsplat(gaussians, cameras, image_width=32, image_height=32)['rgbs'] # torch.Size([4, 77, 32, 32])
+        # output_for_grad_noms = self.model.render_gsplat(gaussians, cameras)['rgbs']  # torch.Size([4, 77, 512, 512])
+        # output_for_grad_noms = F.interpolate(output_for_grad_noms, size=(32, 32), mode='bilinear', align_corners=False) # torch.Size([4, 77, 32, 32])
+        total_attn_map = get_total_attention_maps(attn_maps) # torch.Size([4, 77, 32, 32])
+        for i in range(B):
+            for j in range(C):
+                target_noms = (output_for_grad_noms[j].to(self.device) * total_attn_map[j].to(self.device)).sum()
+                grad_noms = torch.autograd.grad(target_noms, gaussians[i]._features_dc, retain_graph=True, create_graph=False)[0] # torch.Size([110592, 77])
+                gaussian_noms += grad_noms
 
-                    text_z_comp, weights = adjust_text_embeddings(text_embeddings, azimuth, self.opt)
-                    text_z.append(text_z_comp)
+        for i in range(B):
+            gaussians[i]._features_dc = torch.zeros(gaussians[i].get_features.shape[0], 3, device="cuda", requires_grad=True)
+        output_for_grad_denoms = self.model.render_gsplat(gaussians, cameras, image_width=32, image_height=32)['rgbs'] # torch.Size([4, 3, 32, 32])
+        # output_for_grad_denoms = self.model.render_gsplat(gaussians, cameras)['rgbs']  # torch.Size([4, 3, 512, 512])
+        # output_for_grad_denoms = F.interpolate(output_for_grad_denoms, size=(32, 32), mode='bilinear', align_corners=False) # torch.Size([4, 3, 32, 32])
+        for i in range(B):
+            for j in range(C):
+                target_denoms = output_for_grad_denoms[j].to(self.device).sum()
+                grad_denoms = torch.autograd.grad(target_denoms, gaussians[i]._features_dc, retain_graph=True, create_graph=False)[0]# torch.Size([110592, 3])
+                gaussian_denoms += grad_denoms[:, 0]
 
-                else:
-                    for c in range(C):
-                        if azimuth[c] >= -90 and azimuth[c] < 90:
-                            if azimuth[c] >= 0:
-                                r = 1 - azimuth[c] / 90
-                            else:
-                                r = 1 + azimuth[c] / 90
-                            start_z = text_embeddings['front']
-                            end_z = text_embeddings['side']
-                        else:
-                            if azimuth[c] >= 0:
-                                r = 1 - (azimuth[c] - 90) / 90
-                            else:
-                                r = 1 + (azimuth[c] + 90) / 90
-                            start_z = text_embeddings['side']
-                            end_z = text_embeddings['back']
-                        text_z.append(r * start_z + (1 - r) * end_z)
+        diffusion_attn = gaussian_noms / gaussian_denoms[..., None] # torch.Size([110592, 77])
+        diffusion_attn = diffusion_attn / diffusion_attn.norm(dim=1, keepdim=True)
+        diffusion_attn = torch.nan_to_num(diffusion_attn)
 
-                text_z = torch.cat(text_z, dim=0)
-                if self.opt.perpneg:
-                    loss = loss + self.guidance['IF2'].train_step_perpneg(text_z, weights, images,
-                                                                          guidance_scale=self.opt.guidance_scale,
-                                                                          grad_scale=self.opt.lambda_guidance)
-                else:
-                    loss = loss + self.guidance['IF2'].train_step(text_z, images,
-                                                                  guidance_scale=self.opt.guidance_scale,
-                                                                  grad_scale=self.opt.lambda_guidance)
-        return images, None, loss
+        attn_loss = 0
+        for i in range(len(gtf_attns)):
+            attn_loss += (1 - F.cosine_similarity(gtf_attns[i], diffusion_attn, dim=-1).mean())
+
+        max_step = 1000
+        current_step = min(global_step, max_step)
+        lambda_attn = 1000 + (5000 - 1000) * (current_step - 1) / (max_step - 1)
+        loss = guidance_loss + (lambda_attn * attn_loss)
+    
+        return images, None, loss, guidance_loss, attn_loss
 
     def post_train_step(self):
 
@@ -437,117 +407,119 @@ class Trainer(object):
                 text_zs.append(data[i]['text_embeddings']['default'])  # incorporate each word
                 cameras.append(data[i]['cameras'])
             text_zs = torch.cat(text_zs, dim=0)  # [B, 77, 1024]
-            outputs, all_top_k_indices, opacity_list, output_gaussians = self.model(text_zs, cameras)
+            outputs, gtf_attns, opacity_list, gaussians = self.model(text_zs, cameras)
 
-            prompt_objects = "potted plant skateboard"
-            layer_class_outputs = []
+            ##################################################################################################################
+            if self.epoch != 0:
+                gaussian_noms = torch.zeros(gaussians[0].get_features.shape[0], 77, device=self.device)
+                gaussian_denoms = torch.ones(gaussians[0].get_features.shape[0], device=self.device) * 1e-12
+
+                with torch.enable_grad():
+                    for i in range(B):
+                        gaussians[i]._features_dc = torch.zeros(gaussians[i].get_features.shape[0], 77, device="cuda", requires_grad=True)
+                    output_for_grad_noms = self.model.render_gsplat(gaussians, cameras, image_width=32, image_height=32)['rgbs'] # torch.Size([4, 77, 32, 32])
+                    total_attn_map = get_total_attention_maps(attn_maps) # torch.Size([4, 77, 32, 32])
+                    for i in range(B):
+                        for j in range(C):
+                            target_noms = (output_for_grad_noms[j].to(self.device) * total_attn_map[j].to(self.device)).sum()
+                            grad_noms = torch.autograd.grad(target_noms, gaussians[i]._features_dc, retain_graph=True, create_graph=False)[0] # torch.Size([110592, 77])
+                            gaussian_noms += grad_noms
+
+                    for i in range(B):
+                        gaussians[i]._features_dc = torch.zeros(gaussians[i].get_features.shape[0], 3, device="cuda", requires_grad=True)
+                    output_for_grad_denoms = self.model.render_gsplat(gaussians, cameras, image_width=32, image_height=32)['rgbs'] # torch.Size([4, 3, 32, 32])
+                    for i in range(B):
+                        for j in range(C):
+                            target_denoms = output_for_grad_denoms[j].to(self.device).sum()
+                            grad_denoms = torch.autograd.grad(target_denoms, gaussians[i]._features_dc, retain_graph=True, create_graph=False)[0]# torch.Size([110592, 3])
+                            gaussian_denoms += grad_denoms[:, 0]
+
+                diffusion_attn = gaussian_noms / gaussian_denoms[..., None] # torch.Size([110592, 77])
+                diffusion_attn = diffusion_attn / diffusion_attn.norm(dim=1, keepdim=True)
+                diffusion_attn = torch.nan_to_num(diffusion_attn)
+            ##################################################################################################################
+
+            layers_output = []
             for b in range(B):
-                opacities = opacity_list[b]
-                selected_indices = [i for i, opacity in enumerate(opacities) if opacity > 0.01]
-                if not selected_indices:
-                    print(f"========= No valid indices =========")
-                
+                if 'IF' in self.guidance:
+                    clean_prompt = self.guidance['IF'].pipe._text_preprocessing(self.opt.prompt, clean_caption=False)
+                    token_ids = self.guidance['IF'].tokenizer(clean_prompt, padding='max_length', max_length=77, truncation=True, add_special_tokens=True)['input_ids']
+                    token_ids = token_ids if token_ids and isinstance(token_ids[0], list) else [token_ids]
+                    token_ids = [list(filter(lambda x: x != 0, sublist)) for sublist in token_ids]
+                    total_tokens = [self.guidance['IF'].tokenizer.convert_ids_to_tokens(token_id) for token_id in token_ids]
+
+                    _gaussian = gaussians[b]
+
+                    for i in range(len(gtf_attns)):
+                        gtf_attns[i] = (gtf_attns[i] - gtf_attns[i].min()) / (gtf_attns[i].max() - gtf_attns[i].min())
+                        token_output = []
+                        out_tokens = []
+                        for j, token in enumerate(total_tokens[0]):
+                            # if token == '▁' or token == '</s>':
+                            #     continue
+                            if token not in ('▁knight', 'fire'):
+                                continue
+
+                            out_tokens.append(token)
+
+                            attn = gtf_attns[i].squeeze(0)[:,j] # torch.Size([110592])
+                            # gaussian_color = attn.unsqueeze(-1).repeat(1, 3).unsqueeze(1) # torch.Size([110592, 1, 3])
+
+                            hue = (2/3) * (1 - attn.cpu().numpy())  # red to blue
+                            saturation = 1.0
+                            value = 1.0
+                            rgb_colors = [colorsys.hsv_to_rgb(h, saturation, value) for h in hue]
+                            gaussian_color = torch.tensor(rgb_colors, dtype=torch.float32, device=_gaussian._xyz.device).unsqueeze(1) # torch.Size([110592, 1, 3])
+                            _gaussian._features_dc = gaussian_color
+
+                            background = torch.tensor([[1.0, 1.0, 1.0]]).to(self.device)
+                            rgb = self.model.render_gsplat([_gaussian], [cameras[b]], sh_degree=0, background=background)['rgbs']
+                            token_output.append(rgb.to("cpu"))
+
+                            del rgb
+                            torch.cuda.empty_cache()
+                            gc.collect()
+
+                        layers_output.append(token_output)
+
+                    ##################################################################################################################
+                    token_output_diffusion = []
+                    if self.epoch != 0:
+                        diffusion_attn = (diffusion_attn - diffusion_attn.min()) / (diffusion_attn.max() - diffusion_attn.min())
+                        for j, token in enumerate(total_tokens[0]):
+                            # if token == '▁' or token == '</s>':
+                            #     continue
+                            if token not in ('▁knight', 'fire'):
+                                continue
+
+                            attn = diffusion_attn[:,j] # torch.Size([110592])
+                            # attn = (attn - attn.min()) / (attn.max() - attn.min())
+
+                            hue = (2/3) * (1 - attn.cpu().numpy())  # red to blue
+                            saturation = 1.0
+                            value = 1.0
+                            rgb_colors = [colorsys.hsv_to_rgb(h, saturation, value) for h in hue]
+                            gaussian_color = torch.tensor(rgb_colors, dtype=torch.float32, device=_gaussian._xyz.device).unsqueeze(1) # torch.Size([110592, 1, 3])
+                            _gaussian._features_dc = gaussian_color
+
+                            background = torch.tensor([[1.0, 1.0, 1.0]]).to(self.device)
+                            rgb = self.model.render_gsplat([_gaussian], [cameras[b]], sh_degree=0, background=background)['rgbs']
+                            token_output_diffusion.append(rgb.to("cpu"))
+                    ##################################################################################################################
+
                 else:
-                    print(f'============== total / valid gaussians: {len(opacities)} / {len(selected_indices)} ==============')
-
-                    k = all_top_k_indices[0][b].shape[1]
-                    if 'IF' in self.guidance:
-                        clean_prompt = self.guidance['IF'].pipe._text_preprocessing(self.opt.prompt, clean_caption=False)
-                        inputs = self.guidance['IF'].tokenizer(clean_prompt, padding='max_length', max_length=77, truncation=True, add_special_tokens=True, return_tensors='pt')
-                    elif 'SD' in self.guidance:
-                        inputs = self.guidance['SD'].tokenizer(self.opt.prompt, padding='max_length', max_length=self.guidance['SD'].tokenizer.model_max_length, return_tensors='pt')
-
-                    appear_index_text = []
-                    desired_token = [1, 8, 7, 6, 9]
-                    class_color_mapping = {
-                        1: (1.0, 0.0, 0.0),  # red - astronaut
-                        8: (0.0, 1.0, 0.0),  # green - o
-                        7: (0.0, 0.0, 1.0),  # blue - gar
-                        6: (1.0, 1.0, 0.0),  # yellow - kan
-                        9: (1.0, 0.0, 1.0),  # purple - o
-                        #10: (0.0, 1.0, 1.0),  # cyan - airplane
-                    }
-
-                    
-                    for i in range (len(all_top_k_indices)):
-                        print(f"============== Layer {i} top {k} attention scores ==============")
-                        max_indices = np.array(all_top_k_indices[i][b].cpu()) # [110592, 5]
-
-                        filtered_indices = max_indices[selected_indices] # [valid gaussians num, 5]
-                        
-                        filtered_indices_tensor = torch.tensor(filtered_indices, dtype=torch.long, device=self.device).view(-1)
-                        counts = torch.bincount(filtered_indices_tensor)
-                        values = torch.arange(len(counts), device=self.device)
-                        results = list(zip(values.tolist(), counts.tolist()))
-                        sorted_results = sorted(results, key=lambda x: x[1], reverse=True)
-
-                        for value, count in sorted_results:
-                            if count > 0:
-                                if 'IF' in self.guidance:
-                                    decoded_text = self.guidance['IF'].tokenizer.decode(inputs.input_ids[0][value], skip_special_tokens=False)
-                                elif 'SD' in self.guidance:
-                                    decoded_text = self.guidance['SD'].tokenizer.decode(inputs.input_ids[0][value], skip_special_tokens=False)
-
-                                if (value, decoded_text) not in appear_index_text and decoded_text not in ["<pad>", "</s>", ""]:
-                                    appear_index_text.append((value, decoded_text))
-
-                                # if decoded_text.strip() and decoded_text not in ["<pad>", "</s>"]:
-                                print(f"index {value} -> token {inputs.input_ids[0][value]} -> {decoded_text} 出現 {count} 次")
-
-                        gaussian_classes = np.full((max_indices.shape[0],), None, dtype=object)
-                        for gaussian_idx in range(max_indices.shape[0]):
-                            gaussian_top_k = max_indices[gaussian_idx]
-                            gaussian_class = next((idx for idx in gaussian_top_k if idx in desired_token), None)
-                            gaussian_classes[gaussian_idx] = gaussian_class
-
-                        print(f'gaussian_classes shape: {gaussian_classes.shape}')
-
-                        gaussian = GaussianModel(0)
-                        gaussian._xyz = output_gaussians[b]._xyz
-                        gaussian._opacity = output_gaussians[b]._opacity
-                        gaussian._rotation = output_gaussians[b]._rotation
-                        gaussian._scaling = output_gaussians[b]._scaling
-
-                        colors = []
-                        for gaussian_idx in range(len(output_gaussians[b]._xyz)):
-                            gaussian_class = gaussian_classes[gaussian_idx]  # 假設你已有 gaussian_classes 的對應類別
-                            color = class_color_mapping.get(gaussian_class, (0.5, 0.5, 0.5))  # 預設為灰色
-                            colors.append(color)
-                        gaussian._features_dc = torch.tensor(colors, dtype=torch.float32, device=self.device).unsqueeze(1)
-                        print(appear_index_text)
-                        class_outputs = self.model.render([gaussian], [cameras[b]])['rgbs']
-                        layer_class_outputs.append(class_outputs)
-                        
-
-                # print(f'output_gaussians feaure dc: {output_gaussians[0]._features_dc.shape}')
+                    print("not implemented")
                 
-                # new_oapcity = output_gaussians[0]._opacity
-                # for i in range(len(output_gaussians[0]._opacity)):
-                #     if output_gaussians[0]._features_dc[i][0][0] < 0.2:
-                #         new_oapcity[i] = -1000
-                
-                # plane_gaussian = GaussianModel(0)
-                # plane_gaussian._xyz = output_gaussians[0]._xyz
-                # plane_gaussian._opacity = new_oapcity
-                # plane_gaussian._rotation = output_gaussians[0]._rotation
-                # plane_gaussian._scaling = output_gaussians[0]._scaling
-                # plane_gaussian._features_dc = output_gaussians[0]._features_dc
-
-                # plane_outputs = self.model.render([plane_gaussian], [cameras[b]])['rgbs']
-                # layer_class_outputs.append(plane_outputs)
-
-                # model_path = os.path.join(self.workspace, 'checkpoints', f"DreamInit_ep{self.epoch:04d}.pth")
-                # save_xyz_color(self.opt, self.opt.prompt, model_path, self.workspace + '/xyz_split.pt', self.workspace + '/color_split.pt', [plane_gaussian])
-            
-
             pred_images = outputs['rgbs']  # [B*C, 3, H, W]
+            print(out_tokens)
 
-            return pred_images, layer_class_outputs, output_gaussians
+            return pred_images, layers_output, token_output_diffusion, out_tokens, gaussians
+        
 
     def train(self, train_loader, valid_loader, test_loader, max_epochs):
 
         if self.use_tensorboardX and self.local_rank == 0:
-            self.writer = tensorboardX.SummaryWriter(os.path.join(self.workspace, "run", self.name))
+            self.writer = tensorboardX.SummaryWriter(os.path.join(self.workspace, "run", self.name), flush_secs=3)
 
         start_t = time.time()
 
@@ -617,7 +589,7 @@ class Trainer(object):
                     self.local_step += 1
 
                     with torch.cuda.amp.autocast(enabled=self.fp16):
-                        preds, layer_class_outputs, output_gaussians = self.eval_step(data)
+                        preds, layer_outputs, token_output_diffusion, out_tokens, output_gaussians = self.eval_step(data)
                         preds = preds * 255
                         preds = preds.permute(0, 2, 3, 1)
                         imageio.mimwrite(os.path.join(save_path, f"ep{self.epoch:05d}_{data[i]['text']}.mp4"),
@@ -625,22 +597,33 @@ class Trainer(object):
                                          macro_block_size=1)
                         
                         # save layer gaussian text embeddings video
-                        # for l in range(len(layer_class_outputs)):
-                        #     class_outputs = layer_class_outputs[l] * 255
-                        #     class_outputs = class_outputs.permute(0, 2, 3, 1)
-                        #     imageio.mimwrite(os.path.join(save_path, f"ep{self.epoch:05d}_layer{l}.mp4"),
-                        #                     class_outputs.to(torch.uint8).cpu(), fps=25, quality=8,
-                        #                     macro_block_size=1)
+                        epoch_folder = os.path.join(save_path, f"ep{self.epoch:05d}")
+                        os.makedirs(epoch_folder, exist_ok=True)
+                        for l, layer in enumerate(layer_outputs):
+                            for t, token_output in enumerate(layer):
+                                token_output = (token_output * 255).permute(0, 2, 3, 1)
+                                file_path = os.path.join(epoch_folder, f"layer_{l}_token_{t}_{out_tokens[t]}.mp4")
+                                imageio.mimwrite(file_path,
+                                                token_output.to(torch.uint8).cpu(), 
+                                                fps=25, quality=8,
+                                                macro_block_size=1)
                         
-                        
-
-
-            
+                        if token_output_diffusion:
+                            for t, token_output in enumerate(token_output_diffusion):
+                                token_output = (token_output * 255).permute(0, 2, 3, 1)
+                                file_path = os.path.join(epoch_folder, f"diffusion_token_{t}_{out_tokens[t]}.mp4")
+                                imageio.mimwrite(file_path,
+                                                token_output.to(torch.uint8).cpu(), 
+                                                fps=25, quality=8,
+                                                macro_block_size=1)
+                                       
         
         if self.epoch > 0:
             model_path = os.path.join(self.workspace, 'checkpoints', f"DreamInit_ep{self.epoch:04d}.pth")
-            save_xyz_path = os.path.join(self.workspace, f'xyz_{self.epoch:04d}.pt')
-            save_color_path = os.path.join(self.workspace, f'color_{self.epoch:04d}.pt')
+            save_xyz_path = os.path.join(self.workspace, 'xyz_pt', f'xyz_{self.epoch:04d}.pt')
+            save_color_path = os.path.join(self.workspace, 'color_pt', f'color_{self.epoch:04d}.pt')
+            os.makedirs(os.path.dirname(save_xyz_path), exist_ok=True)
+            os.makedirs(os.path.dirname(save_color_path), exist_ok=True)
             save_xyz_color(self.opt, self.opt.prompt,model_path,save_xyz_path,save_color_path, output_gaussians)
 
         if self.local_rank == 0:
@@ -690,7 +673,7 @@ class Trainer(object):
                     save_guidance_path = save_guidance_folder / f'step_{self.global_step:07d}.png'
                 else:
                     save_guidance_path = None
-                pred_rgbs, pred_depths, loss = self.train_step(data, global_step=self.global_step, save_guidance_path=save_guidance_path)
+                pred_rgbs, pred_depths, loss, guidance_loss, attn_loss = self.train_step(data, global_step=self.global_step, save_guidance_path=save_guidance_path)
 
             self.scaler.scale(loss).backward()
             self.post_train_step()
@@ -707,10 +690,13 @@ class Trainer(object):
 
                 if self.use_tensorboardX:
                     self.writer.add_scalar("train/loss", loss_val, self.global_step)
+                    self.writer.add_scalar("train/guidance_loss", guidance_loss.item(), self.global_step)
+                    self.writer.add_scalar("train/attn_loss", attn_loss.item(), self.global_step)
                     self.writer.add_scalar("train/lr", self.optimizer.param_groups[0]['lr'], self.global_step)
 
                 if self.scheduler_update_every_step:
-                    pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f}), rank={self.local_rank}, lr={self.optimizer.param_groups[0]['lr']:.6f}")
+                    pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f}), guidance_loss={guidance_loss:.4f}, attn_loss={attn_loss:.4f}, rank={self.local_rank}, lr={self.optimizer.param_groups[0]['lr']:.6f}")
+                    # pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f}), guidance_loss={guidance_loss:.4f}, rank={self.local_rank}, lr={self.optimizer.param_groups[0]['lr']:.6f}")
                 else:
                     pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f})")
                 pbar.update(loader.batch_size)
@@ -764,7 +750,7 @@ class Trainer(object):
                 self.local_step += 1
 
                 with torch.cuda.amp.autocast(enabled=self.fp16):
-                    preds, _, _ = self.eval_step(data)
+                    preds, _, _, _, _ = self.eval_step(data)
                     preds = preds.permute(0, 2, 3, 1)
                     save_img.append(preds)
 

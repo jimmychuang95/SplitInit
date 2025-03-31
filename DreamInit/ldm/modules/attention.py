@@ -191,15 +191,14 @@ class CrossAttention(nn.Module):
         out = einsum('b i j, b j d -> b i d', attn, v)
         out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
 
-        if self.training:
-            return self.to_out(out)
-        else:
-            # max_indices = torch.argmax(attn, dim=-1).clone().detach()
-            # return self.to_out(out), max_indices
+        return self.to_out(out), attn
+        # else:
+        #     max_indices = torch.argmax(attn, dim=-1).clone().detach()
+        #     return self.to_out(out), max_indices
 
-            _, topk_indices = torch.topk(attn, k=7, dim=-1)
-            topk_indices = topk_indices.clone().detach()
-            return self.to_out(out), topk_indices
+        #     _, topk_indices = torch.topk(attn, k=7, dim=-1)
+        #     topk_indices = topk_indices.clone().detach()
+        #     return self.to_out(out), topk_indices
             
 
 class PatchSelfAttention(nn.Module):
@@ -306,25 +305,16 @@ class PSTransformerBlock(nn.Module):
         self.checkpoint = checkpoint
 
     def forward(self, p, x, context=None):
-        if self.training:
-            return checkpoint(self._forward, (p, x, context), self.parameters(), self.checkpoint)
-        else:
-            x, top_k_indices = checkpoint(self._forward, (p, x, context), self.parameters(), self.checkpoint)
-            return x, top_k_indices
+        return checkpoint(self._forward, (p, x, context), self.parameters(), self.checkpoint)
+
 
     def _forward(self, p, x, context=None):
         x = self.attn1(p, self.norm1(x), context=context if self.disable_self_attn else None) + x
+        attn2_out, attn = self.attn2(self.norm2(x), context=context)
+        x = attn2_out + x
+        x = self.ff(self.norm3(x)) + x
+        return x, attn
 
-        if self.training:
-            x = self.attn2(self.norm2(x), context=context) + x
-            x = self.ff(self.norm3(x)) + x
-            return x
-        else:
-            attn2_out, top_k_indices = self.attn2(self.norm2(x), context=context)
-            x = attn2_out + x
-            top_k_indices = top_k_indices.clone().detach()
-            x = self.ff(self.norm3(x)) + x
-            return x, top_k_indices
 
 
 class SpatialTransformer(nn.Module):

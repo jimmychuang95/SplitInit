@@ -129,7 +129,7 @@ def attn_kv_call(self, attn: Attention, hidden_states, encoder_hidden_states=Non
             )
 
             text_length = encoder_hidden_states_key_proj.shape[2]  # 取 key 的 text 部分長度
-            prune_attention_probs = attention_probs[:, :, :, :text_length].cpu()
+            prune_attention_probs = attention_probs[:, :, :, :text_length]
 
             _, _, seq_len, _ = prune_attention_probs.shape
             height = int(math.sqrt(seq_len))
@@ -478,6 +478,31 @@ def init_pipeline(pipeline):
 
     return pipeline
 
+
+def get_total_attention_maps(attn_maps, B = 4, unconditional=True):
+
+    total_attn_map = list(attn_maps.values())[0].sum(1) # sum over heads
+    if unconditional:
+        total_attn_map = total_attn_map[B:]  # (12, height, width, attn_dim)
+    total_attn_map = total_attn_map.split(B, dim=0)[0] # (4, height, width, attn_dim)
+
+    total_attn_map = total_attn_map.permute(0, 3, 1, 2)
+    total_attn_map = torch.zeros_like(total_attn_map)
+    total_attn_map_shape = total_attn_map.shape[-2:]
+    total_attn_map_number = 0
+
+    for _, attn_map in attn_maps.items():        
+        attn_map = attn_map.sum(1).squeeze(1).permute(0, 3, 1, 2) # (16, attn_dim, height, width)
+        if unconditional:
+            attn_map = attn_map[B:]
+        attn_map = attn_map.split(B, dim=0)[0] # (4, attn_dim, height, width)
+        
+        resized_attn_map = F.interpolate(attn_map, size=total_attn_map_shape, mode='bilinear', align_corners=False)
+        total_attn_map += resized_attn_map
+        total_attn_map_number += 1
+    
+    total_attn_map /= total_attn_map_number
+    return total_attn_map
 
 def save_attention_maps(attn_maps, pipe, prompts, global_step, base_dir='attn_maps', B = 4, unconditional=True):
     to_pil = ToPILImage()

@@ -198,7 +198,7 @@ if __name__ == '__main__':
     parser.add_argument('--save_guidance', action='store_true', help="save images of the per-iteration NeRF renders, added noise, denoised (i.e. guidance), fully-denoised. Useful for debugging, but VERY SLOW and takes lots of memory!")
     parser.add_argument('--save_guidance_interval', type=int, default=10, help="save guidance every X step")
 
-    parser.add_argument('--save_interval', type=int, default=2, help="ckpt save interval")
+    parser.add_argument('--save_interval', type=int, default=5, help="ckpt save interval")
     parser.add_argument('--port', type=str, default='12355')
     parser.add_argument('--ema_decay', type=float, default=None)
 

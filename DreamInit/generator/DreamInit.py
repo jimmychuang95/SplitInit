@@ -4,7 +4,9 @@ from .generator import Generator
 from generator.gaussian_utils.gaussian_model import GaussianModel
 from generator.gaussian_utils.gaussian_renderer import render
 import numpy as np
+
 from gsplat import rasterization
+import math
 
 C0 = 0.28209479177387814
 def RGB2SH(rgb):
@@ -48,10 +50,8 @@ class DreamInit(nn.Module):
         B = text_embeddings.shape[0]
         input = self.xyz.unsqueeze(0).repeat(B, 1, 1)
 
-        if self.training:
-            gaussians_property = self.generator(input, text_embeddings)
-        else:
-            gaussians_property, all_top_k_indices = self.generator(input, text_embeddings)
+
+        gaussians_property, gtf_attns = self.generator(input, text_embeddings)
 
         gaussians_property = gaussians_property.to(torch.float32)
         gaussian_list = []  # (B,)
@@ -69,9 +69,9 @@ class DreamInit(nn.Module):
             opacity_list.append(gaussian._opacity)
 
         if self.training:
-            return gaussian_list
+            return gaussian_list, gtf_attns
         else:
-            return gaussian_list, all_top_k_indices, opacity_list
+            return gaussian_list, gtf_attns, opacity_list
 
     def render(self, gaussians, views):
         B = len(gaussians)
@@ -87,25 +87,51 @@ class DreamInit(nn.Module):
         rgbs = torch.stack(rgbs, dim=0)
         return {'rgbs': rgbs}
     
-    def render_gsplat(self, gaussians, views):
+    def calculate_K(self, width, height, FoVx, FoVy, device):
+        fx = 0.5 * width / math.tan(0.5 * FoVx)
+        fy = 0.5 * height / math.tan(0.5 * FoVy)
+        cx = width / 2
+        cy = height / 2
+
+        K = torch.tensor([
+            [fx, 0, cx],
+            [0, fy, cy],
+            [0, 0,  1]
+        ], device=device)
+
+        return K
+    
+    def render_gsplat(self, gaussians, views, sh_degree=None, background=None, image_width=None, image_height=None):
         B = len(gaussians)
         C = len(views[0])
+        
         rgbs = []
         for i in range(B):
             gaussian = gaussians[i]
             for j in range(C):
                 view = views[i][j]
+
+                if image_width is not None and image_height is not None:
+                    K = self.calculate_K(image_width, image_height, view.FoVx, view.FoVy, device='cuda')
+                    width = image_width
+                    height = image_height
+                else:
+                    K = view.K
+                    width = view.image_width
+                    height = view.image_height
+
                 output, _, _ = rasterization(
-                    gaussian._xyz,
-                    gaussian._rotation,
-                    gaussian._scaling,
-                    gaussian._opacity.squeeze(-1),
-                    gaussian._features_dc,
+                    gaussian.get_xyz,
+                    gaussian.get_rotation,
+                    gaussian.get_scaling,
+                    gaussian.get_opacity.squeeze(-1),
+                    gaussian.get_features,
                     view.viewmat[None],
-                    view.K[None],
-                    width=view.image_width,
-                    height=view.image_height,
-                    sh_degree=0,
+                    K[None],
+                    width=width,
+                    height=height,
+                    sh_degree=sh_degree,
+                    backgrounds=background,
                 )
                 rgb = output.permute(0, 3, 1, 2).squeeze(0)
                 rgbs.append(rgb)
@@ -114,14 +140,17 @@ class DreamInit(nn.Module):
 
 
     def forward(self, text_zs, cameras):
+        background = torch.ones((1, 3)).to("cuda")
         if self.training:
-            gaussians = self.gaussian_generate(text_zs)
-            outputs = self.render_gsplat(gaussians, cameras)
-            return outputs, gaussians
+            gaussians, gtf_attns = self.gaussian_generate(text_zs)
+            # outputs = self.render(gaussians, cameras)
+            outputs = self.render_gsplat(gaussians, cameras, sh_degree=0, background=background)
+            return outputs, gtf_attns, gaussians
         else:
-            gaussians, all_top_k_indices, opacity_list = self.gaussian_generate(text_zs)
-            outputs = self.render_gsplat(gaussians, cameras)
-            return outputs, all_top_k_indices, opacity_list, gaussians
+            gaussians, gtf_attns, opacity_list = self.gaussian_generate(text_zs)
+            # outputs = self.render(gaussians, cameras)
+            outputs = self.render_gsplat(gaussians, cameras, sh_degree=0, background=background)
+            return outputs, gtf_attns, opacity_list, gaussians
 
     def get_params(self, lr):
 
